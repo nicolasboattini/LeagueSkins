@@ -79,7 +79,7 @@ def _w(v):
 class Bin:
     def __init__(s, d):
         s.pre = b''
-        if d[:4] == b'PTCH': s.pre, d = d[:16], d[16:]
+        if d[:4] == b'PTCH': s.pre, d = d[:12], d[12:]
         assert d[:4] == b'PROP', d[:4]
         r = _R(d, 4); s.ver = r.u('I'); s.links = []
         if s.ver >= 2:

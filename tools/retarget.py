@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Retarget a .fantome skin mod to another skin slot.
-Usage: python tools/retarget.py IN.fantome CHAMP TO_SLOT OUT.fantome [--from N] [--name "Display name"]
+CLI:  python retarget.py IN.fantome CHAMP TO_SLOT OUT.fantome [--from N] [--name "Display name"]
+Lib:  retarget_bytes(fantome_bytes, champ, to_slot, frm=None, name=None) -> (bytes, info)
 Requires: pip install xxhash zstandard
 """
-import sys, io, json, struct, zipfile, argparse, gzip
+import sys, io, json, struct, zipfile, argparse, gzip, hashlib
 import xxhash, zstandard
 
 def fnv(s):
@@ -61,34 +62,47 @@ def fix_links(d, champ, a, b):
     c = champ.lower(); new = []
     for s in links:
         for kind in ('skins', 'animations'):
-            old = f'data/characters/{c}/{kind}/skin{a}.bin'
-            if s.lower() == old: s = f'data/characters/{c}/{kind}/skin{b}.bin'
+            if s.lower() == f'data/characters/{c}/{kind}/skin{a}.bin':
+                s = f'data/characters/{c}/{kind}/skin{b}.bin'
         new.append(s)
     out = d[:8] + struct.pack('<I', len(new))
     for s in new:
         e = s.encode(); out += struct.pack('<H', len(e)) + e
     return pre + out + d[p:]
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('inp'); ap.add_argument('champ'); ap.add_argument('to', type=int); ap.add_argument('out')
-    ap.add_argument('--from', dest='frm', type=int); ap.add_argument('--name')
-    a = ap.parse_args()
-    C = a.champ; c = C.lower()
-    zin = zipfile.ZipFile(a.inp)
-    wadname = next(n for n in zin.namelist() if n.lower().startswith('wad/'))
+def skin_slots(fantome_bytes, champ):
+    """Skin slots that have a skins/skinN.bin inside the mod."""
+    zin = zipfile.ZipFile(io.BytesIO(fantome_bytes))
+    for n in zin.namelist():
+        if not n.lower().startswith('wad/'): continue
+        _, ents = read_wad(zin.read(n))
+        hs = {e[0] for e in ents}
+        c = champ.lower()
+        return [s for s in range(1000) if xx(f'data/characters/{c}/skins/skin{s}.bin') in hs]
+    return []
+
+def retarget_bytes(fantome_bytes, champ, to, frm=None, name=None):
+    C = champ; c = C.lower()
+    zin = zipfile.ZipFile(io.BytesIO(fantome_bytes))
+    wads = [n for n in zin.namelist() if n.lower().startswith('wad/')]
+    if not wads: raise ValueError('el .fantome no tiene WAD')
+    wadname = next((n for n in wads if n.lower() == f'wad/{c}.wad.client'), wads[0])
     hdr, ents = read_wad(zin.read(wadname))
     hashes = {e[0] for e in ents}
-    found = [n for n in range(200) if xx(f'data/characters/{c}/skins/skin{n}.bin') in hashes]
-    if a.frm is None:
-        assert len(found) == 1, f'skin bins found: {found}; use --from'
-        a.frm = found[0]
-    f, t = a.frm, a.to
+    found = [n for n in range(1000) if xx(f'data/characters/{c}/skins/skin{n}.bin') in hashes]
+    if frm is None:
+        if len(found) != 1:
+            raise ValueError(f'no pude detectar el slot de origen (skins encontradas: {found}). '
+                             'Puede que el campeón no coincida con el mod.')
+        frm = found[0]
+    f, t = frm, to
+    if f == t: raise ValueError(f'el mod ya apunta al slot {t}')
     rep = {}
     for tpl in ('Characters/{C}/Skins/Skin{n}', 'Characters/{C}/Skins/Skin{n}/Resources', 'Characters/{C}/Animations/Skin{n}'):
         rep[struct.pack('<I', fnv(tpl.format(C=C, n=f)))] = struct.pack('<I', fnv(tpl.format(C=C, n=t)))
     ren = {xx(f'data/characters/{c}/{k}/skin{f}.bin'): xx(f'data/characters/{c}/{k}/skin{t}.bin') for k in ('skins', 'animations')}
-    assert not (set(ren.values()) & hashes - set(ren)), 'target slot already present in mod'
+    if set(ren.values()) & (hashes - set(ren)):
+        raise ValueError(f'el mod ya contiene archivos del slot {t}')
     log = []
     for e in ents:
         d = e[1]
@@ -98,16 +112,39 @@ def main():
             if nd != d: log.append(f'{e[0]:016x} patched'); e[1] = nd
         if e[0] in ren: log.append(f'{e[0]:016x} renamed'); e[0] = ren[e[0]]
     wad = write_wad(hdr, ents)
-    with zipfile.ZipFile(a.out, 'w', zipfile.ZIP_DEFLATED) as zo:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zo:
         for n in zin.namelist():
-            if n == wadname: zo.writestr(n, wad, compress_type=zipfile.ZIP_STORED); continue
+            if n == wadname:
+                zo.writestr(n, wad, compress_type=zipfile.ZIP_STORED); continue
             data = zin.read(n)
             if n == 'META/info.json':
                 info = json.loads(data)
-                if a.name: info['Name'] = a.name
+                if name: info['Name'] = name
                 info['Description'] = (info.get('Description', '') + f' Retargeted skin{f} -> skin{t}.').strip()
                 data = json.dumps(info, indent=2).encode()
+            elif n == 'META/build.json':
+                try:
+                    b = json.loads(data)
+                    if isinstance(b.get('payloadSha256'), dict) and wadname in b['payloadSha256']:
+                        b['payloadSha256'][wadname] = hashlib.sha256(wad).hexdigest()
+                    src = b.get('source')
+                    if isinstance(src, dict) and isinstance(src.get('target'), str):
+                        src['target'] = src['target'].replace(f'/skin{f}.bin', f'/skin{t}.bin')
+                    b['retargeted'] = {'from': f, 'to': t}
+                    data = json.dumps(b, indent=2).encode()
+                except Exception:
+                    pass
             zo.writestr(n, data)
-    print(f'{C}: skin{f} -> skin{t}', *log, sep='\n  ')
+    return out.getvalue(), {'from': f, 'to': t, 'log': log}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('inp'); ap.add_argument('champ'); ap.add_argument('to', type=int); ap.add_argument('out')
+    ap.add_argument('--from', dest='frm', type=int); ap.add_argument('--name')
+    a = ap.parse_args()
+    data, info = retarget_bytes(open(a.inp, 'rb').read(), a.champ, a.to, a.frm, a.name)
+    open(a.out, 'wb').write(data)
+    print(f"{a.champ}: skin{info['from']} -> skin{info['to']}", *info['log'], sep='\n  ')
 
 if __name__ == '__main__': main()
